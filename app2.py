@@ -1,19 +1,26 @@
-from flask import Flask, jsonify
 import requests
 import json
 import pyodbc
 import mysql.connector
+from mysql.connector import connect, Error
 from decimal import Decimal
 from datetime import datetime
 import copy, hashlib, re
 from openai import OpenAI
 import os
+from dotenv import load_dotenv
 from typing import Optional
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
+import uvicorn
+
 # print(pyodbc.version)
 
+load_dotenv("env")
+print("TEST_ENV_SOURCE =", os.getenv("TEST_ENV_SOURCE"))
 
-
-app = Flask(__name__)
+app = FastAPI()
 #DETERMINE TAX AUTHORITY ID BY GL_ENTITY OR JOB IDD 
 tax_mock=[]
 tax_mock = {
@@ -59,7 +66,20 @@ glaccount = {
     '15a99':'2409'
 }
 
-import pyodbc
+# DB connection settings vendorinvoiceautomation db
+db_config = {
+    'host': os.getenv("VENDOR_DB_HOST"),
+    'port':int(os.getenv("MARKETPLACE_DB_PORT", 3306)),
+    'user': os.getenv("VENDOR_DB_USER"),
+    'password': os.getenv("VENDOR_DB_PASS"),
+    'database': os.getenv("VENDOR_DB_NAME"),
+}
+
+
+
+
+def get_db_connection():
+    return mysql.connector.connect(**db_config)
 
 def getDBPORecordById(po_id: str):
     """
@@ -280,11 +300,11 @@ ORDER BY al.line_source, al.line_no;
 def getDBRecordById(invoice_id):
 
     conn_mysql = mysql.connector.connect(
-    host='daynite.c4qbs9ngauhk.us-east-1.rds.amazonaws.com',
-    port=3306,  
-    user='dayniteuser',
-    password='asd123ASD!@#',
-    database='marketplace'
+    host=os.getenv("MARKETPLACE_DB_HOST"),
+    port=int(os.getenv("MARKETPLACE_DB_PORT", 3306)),
+    user=os.getenv("MARKETPLACE_DB_USER"),
+    password=os.getenv("MARKETPLACE_DB_PASS"),
+    database=os.getenv("MARKETPLACE_DB_NAME"),
 )
     cursor_mysql = conn_mysql.cursor(dictionary=True)
     cursor_mysql.execute( """
@@ -317,6 +337,8 @@ def getDBRecordById(invoice_id):
     return data
 
 
+    
+    
 def clean_po_line_data(rows):
     """
     Cleans PO/line rows with fields like:
@@ -498,17 +520,37 @@ def transform_for_ui(response):
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+
+
+
+
+
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 def chatgpt_match_by_description(invoice_items_wo_ids: list[dict],
                                  po_items_wo_ids: list[dict]) -> dict:
     system_msg = {
         "role": "system",
         "content": (
-            "You are an expert at matching invoice items to purchase order items "
-            "based solely on textual description. "
-            "Only output valid JSON in the requested schema. "
-            "For each invoice line, decide if it matches one PO line. "
-            "Be strict: if no good match, mark decision='no_match' and matched_po_line_no=null. "
-            "Return all attempted matches, even failures."
+            "You are an expert at matching invoice line items to purchase order (PO) line items.\n"
+            "Data fields:\n"
+            "- Invoice line: `invoice_line_no`, `invoice_description`.\n"
+            "- PO line: `po_line_no`, `po_description`.\n\n"
+
+            "MATCHING RULES:\n"
+            "1) Compare by natural-language semantics of `invoice_description` ↔ `po_description` only.\n"
+            "2) One-to-one: each PO line may be used at most once (consume-once across all matches).\n"
+            "3) For each invoice line, pick the single best PO line. If no clearly appropriate match exists, "
+            "   return decision='no_match' and matched_po_line_no=null.\n"
+            "4) Confidence ∈ [0,1]: strong alignment → 0.80–0.95; partial → 0.50–0.79; weak/none → 0.00–0.49.\n"
+            "5) `evidence_tokens` must be 1–3 short quoted substrings taken from the descriptions that show key overlapping phrases.\n"
+            "6) `unmatched_po_lines` must contain the PO line numbers that remain unused after all assignments; "
+            "   make them unique and sorted ascending.\n\n"
+
+            "OUTPUT REQUIREMENTS:\n"
+            "- Return VALID JSON ONLY (no prose) that conforms EXACTLY to the provided JSON schema (no extra keys).\n"
+            "- Output one result object per invoice line in the input."
         )
     }
 
@@ -520,13 +562,13 @@ def chatgpt_match_by_description(invoice_items_wo_ids: list[dict],
     user_msg = {
         "role": "user",
         "content": (
-            "Match the following invoice items to purchase order items by description only.\n\n"
+            "Match the following invoice items to purchase order items using textual descriptions only.\n\n"
             f"{json.dumps(user_payload, indent=2)}\n\n"
             "Return JSON with keys: matches, unmatched_po_lines."
         )
     }
 
-    resp = client.chat.completions.create(   # <-- NEW CALL STYLE
+    resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[system_msg, user_msg],
         temperature=0,
@@ -534,21 +576,26 @@ def chatgpt_match_by_description(invoice_items_wo_ids: list[dict],
             "type": "json_schema",
             "json_schema": {
                 "name": "InvoicePOMatches",
+                "strict": True,
                 "schema": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "matches": {
                             "type": "array",
                             "items": {
                                 "type": "object",
+                                "additionalProperties": False,
                                 "properties": {
                                     "invoice_line_no": {"type": "integer"},
                                     "invoice_description": {"type": "string"},
-                                    "decision": {"enum": ["match", "no_match"]},
+                                    "decision": {"type": "string", "enum": ["match", "no_match"]},
                                     "matched_po_line_no": {"type": ["integer", "null"]},
-                                    "confidence": {"type": "number"},
+                                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                                     "evidence_tokens": {
                                         "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 3,
                                         "items": {"type": "string"}
                                     }
                                 },
@@ -572,12 +619,70 @@ def chatgpt_match_by_description(invoice_items_wo_ids: list[dict],
             }
         }
     )
-    
+
     content = resp.choices[0].message.content
-    print(json.loads(content))
-    return json.loads(content)
+    data = json.loads(content)
+
+    # Enforce uniqueness & sorting for safety (since the schema can’t do it here)
+    if "unmatched_po_lines" in data:
+        data["unmatched_po_lines"] = sorted({int(x) for x in data["unmatched_po_lines"]})
+
+    print("Trying to match descriptions for missing IDs (gpt-4o-mini)")
+    print(data)
+    return data
 
 
+
+def send_email(emailcontent: str):
+    # === STEP 1: CONFIGURATION from environment ===
+    tenant_id    = _get_env("AZURE_TENANT_ID")
+    client_id    = _get_env("AZURE_CLIENT_ID")
+    client_secret= _get_env("AZURE_CLIENT_SECRET")
+    user_email   = _get_env("AZURE_GRAPH_USER_EMAIL")  # mailbox to send-as
+
+    # === STEP 2: AUTHENTICATE AND GET TOKEN ===
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    token_data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default"
+    }
+
+    try:
+        token_response = requests.post(token_url, data=token_data, timeout=20)
+        token_response.raise_for_status()
+        access_token = token_response.json()["access_token"]
+        print("Authenticated successfully.")
+    except Exception as e:
+        raise RuntimeError(f"Failed to authenticate: {e}")
+
+    # === STEP 3: SET AUTH HEADER ===
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    # === STEP 4: BUILD EMAIL PAYLOAD ===
+    email_payload = {
+        "message": {
+            "subject": "INV13",
+            "body": {"contentType": "Text", "content": emailcontent},
+            "toRecipients": [{"emailAddress": {"address": "henri.sula@gmail.com"}}],  # change if needed
+        },
+        "saveToSentItems": "true",
+    }
+
+    # === STEP 5: SEND THE EMAIL ===
+    send_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/sendMail"
+    try:
+        send_response = requests.post(send_url, headers=headers, json=email_payload, timeout=20)
+        if send_response.status_code == 202:
+            print("Email sent successfully.")
+        else:
+            raise RuntimeError(f"Failed to send email: {send_response.status_code} - {send_response.text}")
+    except Exception as e:
+        raise RuntimeError(f"Error sending email: {e}")
 
 def _assign_invoice_line_numbers(invoice_id: str, items: list[dict]) -> list[dict]:
     out = []
@@ -601,7 +706,7 @@ def validate_and_match_invoice_items_against_po_strict(
     Strict identity-only validator:
       - Fails if invoice has more lines than PO (no extras logic here).
       - Enforces one-to-one mapping across ID + DESC.
-      - Uses DESC fallback only for ID-unmatched lines vs unused PO lines.
+      - Uses DESC matching only for ID-unmatched lines vs unused PO lines.
     """
     # 0) Hard count rule
     if len(invoice_items) > len(po_items):
@@ -627,75 +732,83 @@ def validate_and_match_invoice_items_against_po_strict(
     invoice_items = _assign_invoice_line_numbers(invoice_id, invoice_items)
 
     # 2) Build PO maps (by vendor_part) and an index by line_no
-    po_by_id: dict[str, list[dict]] = {}
+    
     po_by_line_no = {}
     for po in po_items:
         po_by_line_no[po.get("line_no")] = po
-        vid = _norm(po.get("vendor_part"))
-        if vid:
-            po_by_id.setdefault(vid, []).append(po)
+        
 
-    # 3) Exact ID matches — strict consume-once
+    # Exact ID matches — strict consume-once
     id_matches = []
     used_po_line_nos = set()
     matched_invoice_uids = set()
     inv_unmatched_for_desc = []
 
-    # Group invoice lines by SellerPartNumber
-    inv_by_id: dict[str, list[dict]] = {}
+    
+    # Build dict key vendor_part --> value po object
+    po_by_id = {}
+    for po in po_items:
+        vid = _norm(po.get("vendor_part"))
+        if vid:
+            po_by_id[vid] = po  
+
     for inv in invoice_items:
         sid = _norm(inv.get("SellerPartNumber"))
-        if sid:
-            inv_by_id.setdefault(sid, []).append(inv)
+        if not sid:
+            inv_unmatched_for_desc.append(inv)
+            continue
 
-    # Pair by order, but consume each PO line at most once
-    for sid, inv_list in inv_by_id.items():
-        po_list = po_by_id.get(sid, [])
-        for i, inv in enumerate(inv_list):
-            if i < len(po_list):
-                po_ref = po_list[i]  
-                pln = po_ref.get("line_no")
-                if pln in used_po_line_nos:
-                    # shouldn't happen if PO IDs are unique per occurrence, but guard anyway
-                    inv_unmatched_for_desc.append(inv)
-                    continue
-                id_matches.append({
-                    "type": "id_match",
-                    "invoice_line_no": inv["invoice_line_no"],
-                    "invoice_line_uid": inv["invoice_line_uid"],
-                    "invoice_description": inv.get("ItemDescription",""),
-                    "po_line_no": pln,
-                    "po_description": po_ref.get("description",""),
-                    "confidence": 1.0,
-                })
-                used_po_line_nos.add(pln)
-                matched_invoice_uids.add(inv["invoice_line_uid"])
-            else:
-                # More occurrences on invoice than PO -> leave for DESC step (will likely fail if no unused PO lines remain)
-                inv_unmatched_for_desc.append(inv)
+        po_ref = po_by_id.get(sid)
+        if not po_ref:
+            inv_unmatched_for_desc.append(inv)
+            continue
+
+        pln = po_ref.get("line_no")
+        if pln in used_po_line_nos:
+            inv_unmatched_for_desc.append(inv)
+            continue
+
+        id_matches.append({
+            "type": "id_match",
+            "invoice_line_no": inv["invoice_line_no"],
+            "invoice_line_uid": inv["invoice_line_uid"],
+            "invoice_description": inv.get("ItemDescription",""),
+            "po_line_no": pln,
+            "po_description": po_ref.get("description",""),
+            "confidence": 1.0,
+        })
+        used_po_line_nos.add(pln)
+        matched_invoice_uids.add(inv["invoice_line_uid"])
+
+   
 
     # Add invoice lines with missing/bad IDs to DESCRIPTION pool
-    for inv in invoice_items:
-        if inv["invoice_line_uid"] in matched_invoice_uids:
-            continue
-        sid = _norm(inv.get("SellerPartNumber"))
-        if not sid or sid not in po_by_id:
-            inv_unmatched_for_desc.append(inv)
+    # for inv in invoice_items:
+    #     if inv["invoice_line_uid"] in matched_invoice_uids:
+    #         continue
+    #     sid = _norm(inv.get("SellerPartNumber"))
+    #     if not sid :
+    #         inv_unmatched_for_desc.append(inv)
 
-    # 4) DESC fallback only against UNUSED PO lines (strict one-to-one across ID + DESC)
+    #DESC fallback only against UNUSED PO lines (strict one-to-one across ID + DESC)
     desc_matches = []
     ai_resp=''
     if ai_match_fn and inv_unmatched_for_desc:
         po_unused = [po for po in po_items if po.get("line_no") not in used_po_line_nos]
         if po_unused:
             ai_invoice_payload = [
-                {"invoice_line_no": inv["invoice_line_no"], "description": inv.get("ItemDescription","")}
+                {"invoice_line_no": inv["invoice_line_no"], "invoice_description": inv.get("ItemDescription","")}
                 for inv in inv_unmatched_for_desc
             ]
             ai_po_payload = [
-                {"po_line_no": po.get("line_no"), "description": po.get("description","")}
+                {"po_line_no": po.get("line_no"), "po_description": po.get("description","")}
                 for po in po_unused
             ]
+
+            print(ai_po_payload)
+            print("invoiceaipayloaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad")
+            print(ai_invoice_payload)
+            print("invoiceaipayloaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad")
             ai_resp = ai_match_fn(ai_invoice_payload, ai_po_payload)
 
             # One-to-one within DESC, and also against ID-consumed lines
@@ -736,7 +849,7 @@ def validate_and_match_invoice_items_against_po_strict(
             # Merge used PO lines from DESC into the global used set
             used_po_line_nos |= desc_used_po
 
-    # 5) Final strict decision: every invoice line must be matched (count already ≤ PO count)
+    # Final strict decision: every invoice line must be matched (count already ≤ PO count)
     matched_invoice_nos = {m["invoice_line_no"] for m in id_matches} | {m["invoice_line_no"] for m in desc_matches}
     unmatched_invoice_lines = [
         {"invoice_line_no": inv["invoice_line_no"], "description": inv.get("ItemDescription","")}
@@ -764,7 +877,7 @@ def validate_and_match_invoice_items_against_po_strict(
             key = _normalize_for_id(f"{inv_desc}|{po_desc}")
             return "ai_" + hashlib.sha1(key.encode()).hexdigest()[:12]
 
-        # Only desc matches need enrichment (ID matches already agree by definition)
+        # Only desc matches need id_enrichment (ID matches already agree by definition)
         for m in desc_matches:
             iln = int(m["invoice_line_no"])
             pln = int(m["po_line_no"])
@@ -774,26 +887,14 @@ def validate_and_match_invoice_items_against_po_strict(
             inv_line = invoice_items_resolved[inv_i]
             po_line  = po_items_resolved[po_i]
 
-            po_vendor = (po_line.get("vendor_part") or "").strip()
-            if po_vendor:
-                old = (inv_line.get("SellerPartNumber") or "").strip()
-                if old.lower() != po_vendor.lower():
-                    inv_line["SellerPartNumber"] = po_vendor
-                    inv_line["ai_resolution"] = "desc_match"
-                    patch_log.append({
-                        "invoice_line_no": iln,
-                        "po_line_no": pln,
-                        "action": "set_seller_part_from_po_vendor_part",
-                        "value": po_vendor
-                    })
-            else:
-                # generate deterministic ID and set on both sides
-                assigned = make_assigned_id(inv_line.get("ItemDescription",""), po_line.get("description",""))
-                inv_line["SellerPartNumber"] = assigned
-                po_line["vendor_part"] = assigned
-                inv_line["ai_resolution"] = "desc_match"
-                po_line["ai_resolution"] = "desc_match"
-                patch_log.append({
+           
+            # generate deterministic ID and set on both sides
+            assigned = make_assigned_id(inv_line.get("ItemDescription",""), po_line.get("description",""))
+            inv_line["SellerPartNumber"] = assigned
+            po_line["vendor_part"] = assigned
+            inv_line["ai_resolution"] = "desc_match"
+            po_line["ai_resolution"] = "desc_match"
+            patch_log.append({
                     "invoice_line_no": iln,
                     "po_line_no": pln,
                     "action": "assign_synthetic_id_both_sides",
@@ -819,11 +920,6 @@ def validate_and_match_invoice_items_against_po_strict(
         
         
     }
-
-
-
-
-
 
 
 def sortlinenumbers(podata,line_items):
@@ -904,64 +1000,6 @@ def check_taxinfo(PoData,invoice_data):
     return tax_info
 
 
-
-
-
-def send_email(emailcontent: str):
-    # === STEP 1: CONFIGURATION from environment ===
-    tenant_id    = _get_env("AZURE_TENANT_ID")
-    client_id    = _get_env("AZURE_CLIENT_ID")
-    client_secret= _get_env("AZURE_CLIENT_SECRET")
-    user_email   = _get_env("AZURE_GRAPH_USER_EMAIL")  # mailbox to send-as
-
-    # === STEP 2: AUTHENTICATE AND GET TOKEN ===
-    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    token_data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "https://graph.microsoft.com/.default"
-    }
-
-    try:
-        token_response = requests.post(token_url, data=token_data, timeout=20)
-        token_response.raise_for_status()
-        access_token = token_response.json()["access_token"]
-        print("Authenticated successfully.")
-    except Exception as e:
-        raise RuntimeError(f"Failed to authenticate: {e}")
-
-    # === STEP 3: SET AUTH HEADER ===
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-
-    # === STEP 4: BUILD EMAIL PAYLOAD ===
-    email_payload = {
-        "message": {
-            "subject": "INV12",
-            "body": {"contentType": "Text", "content": emailcontent},
-            "toRecipients": [{"emailAddress": {"address": user_email}}],  # change if needed
-        },
-        "saveToSentItems": "true",
-    }
-
-    # === STEP 5: SEND THE EMAIL ===
-    send_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/sendMail"
-    try:
-        send_response = requests.post(send_url, headers=headers, json=email_payload, timeout=20)
-        if send_response.status_code == 202:
-            print("Email sent successfully.")
-        else:
-            raise RuntimeError(f"Failed to send email: {send_response.status_code} - {send_response.text}")
-    except Exception as e:
-        raise RuntimeError(f"Error sending email: {e}")
-
- 
-
-   
-
         
 def can_close_po(invoice_items, po_items):
     #how many units are invoiced per item
@@ -995,7 +1033,7 @@ def can_close_po(invoice_items, po_items):
     return close_po
 
 
-# keep in mind check here if invoice has multiple same SellerPartNumber id-s , if it has add the quantities of those  items together.
+
 #validate if invoice is trying to overvouch
 def validatevouch(invoice_items, po_items):
     matching_pos = []
@@ -1015,11 +1053,69 @@ def validatevouch(invoice_items, po_items):
 
         totalpo_line_item=ordered*unitcost
         allowed_price_peritem=(totalpo_line_item +100) /ordered
-
+       
        
         invoice_item = next((item for item in invoice_items if item['SellerPartNumber'].lower() == part_number_po.lower()),None)# there will always be one
-        if (elegibletobevouchered < int(invoice_item['InvoiceDetailItem:quantity']) or ordered < received or  match['unit_cost'] == int(invoice_item['InvoiceDetailItem:UnitPrice'])) :
+        # if (elegibletobevouchered < int(invoice_item['InvoiceDetailItem:quantity']) or ordered < received or  Decimal(match['unit_cost']) != Decimal(invoice_item['InvoiceDetailItem:UnitPrice'])) :
+        #     isVoucherEligible = False
+        invoice_qty = int(invoice_item['InvoiceDetailItem:quantity'])
+        invoice_price = Decimal(invoice_item['InvoiceDetailItem:UnitPrice'])
+        po_price = Decimal(match['unit_cost'])
+
+
+        if invoice_qty + vouchered > ordered:
+            print(f"{part_number_po}:Quantity Ordered={ordered},Quantity Received={received},Quantity Vouchered={vouchered},elegibletobevouchered={elegibletobevouchered}, Quantity(invoiced)={invoice_item['InvoiceDetailItem:quantity']}, po_price={match['unit_cost']}, invoice_price={invoice_item['InvoiceDetailItem:UnitPrice']}")
+
             isVoucherEligible = False
+            return {
+            "invoiceid" : invoice_item['invoiceID'],
+            "ponumber" : match['prchseordr_id'],
+            "status": "error",
+            "message": f"Bad Invoice qnt higher than ordered",
+            "invoice_type":"bad_invoice",
+            "code": 400
+        }
+
+
+        if elegibletobevouchered < invoice_qty:
+            print(f"{part_number_po}:Quantity Ordered={ordered},Quantity Received={received},Quantity Vouchered={vouchered},elegibletobevouchered={elegibletobevouchered}, Quantity(invoiced)={invoice_item['InvoiceDetailItem:quantity']}, po_price={match['unit_cost']}, invoice_price={invoice_item['InvoiceDetailItem:UnitPrice']}")
+            isVoucherEligible = False
+            return {
+            "invoiceid" : invoice_item['invoiceID'],
+            "ponumber" : match['prchseordr_id'],
+            "status": "error",
+            "message": f"Not enough received to voucher this invoice item: requested from invoice {invoice_qty}, but only {elegibletobevouchered} eligible",
+            "invoice_type":"early_invoice",
+            "code": 400
+        }
+            
+           
+        if ordered < received:
+            isVoucherEligible = False
+            return {
+            "invoiceid" : invoice_item['invoiceID'],
+            "ponumber" : match['prchseordr_id'],
+            "status": "error",
+            "message": f"Overreceipt: PO ordered {ordered}, but received {received}",
+            "invoice_type":"bad_invoice",
+            "code": 400
+        }
+           
+
+        if po_price != invoice_price:
+            isVoucherEligible = False
+            return {
+            "invoiceid" : invoice_item['invoiceID'],
+            "ponumber" : match['prchseordr_id'],
+            "status": "error",
+            "message": f"Price mismatch: PO unit price is {po_price}, but invoice price is {invoice_price}",
+            "invoice_type":"manual_review",
+            "code": 400
+        }
+        
+       
+           
+
         print("Part Number:")    
         print(f"{part_number_po}:Quantity Ordered={ordered},Quantity Received={received},Quantity Vouchered={vouchered},elegibletobevouchered={elegibletobevouchered}, Quantity(invoiced)={invoice_item['InvoiceDetailItem:quantity']}, po_price={match['unit_cost']}, invoice_price={invoice_item['InvoiceDetailItem:UnitPrice']}")
      # Find matching PO line item
@@ -1031,7 +1127,11 @@ def validatevouch(invoice_items, po_items):
         print(totalpo_line_item)
     
     print(isVoucherEligible)
-    return isVoucherEligible;    
+    return {
+    "status": "ok",
+    "message": "Invoice validated successfully",
+    "code": 200
+}   
 
 def check_for_duplicate_items(invoice):
     seen = set()
@@ -1052,21 +1152,7 @@ def check_for_duplicate_items(invoice):
     
      
     
-    # validate if each item in the po exists in the invoice.
-def validate_invoice_items_against_po(invoice_items, po_items):
-    
-    invoice_item_ids = {item['SellerPartNumber'].lower() for item in invoice_items}
-    po_item_ids = {item['vendor_part'].lower() for item in po_items}
 
-    
-    unmatched_items = invoice_item_ids - po_item_ids
-
-    if unmatched_items:
-        print("These item_ids are not in the PO:", unmatched_items)
-        return False
-    else:
-        print("All item_ids in the invoice are present in the PO.")
-        return True
     
 #check if invoice exist and then if po exists
 def validate_single_po(invoiceID,invoice_data,PoData):
@@ -1076,7 +1162,7 @@ def validate_single_po(invoiceID,invoice_data,PoData):
     
     
     if not invoice:
-        return {'status': 'error', 'message': f'Invoice ID {invoiceID} not found.'}, 404
+        return {'invoiceid':f'{invoiceID}','ponumber':'','status': 'error', 'message': f'Invoice ID {invoiceID} not found.','invoice_type':'bad_invoice'}, 404
 
     invoice_po_number = invoice['PONumber'].lower()
     invoice_no = invoice['invoiceID'].lower()
@@ -1089,16 +1175,12 @@ def validate_single_po(invoiceID,invoice_data,PoData):
     purchase_order = next((po for po in PoData if po['prchseordr_id'].lower() == invoice_po_number), None)
     
     if not purchase_order:
-        return {'status': 'error', 'message': f'purchase order id  {invoice_po_number} not found.'}, 404
+        return {'invoiceid':f'{invoice_no}','status': 'error', 'message': f'purchase order id  {invoice_po_number} not found.','invoice_type':'bad_invoice'}, 404
     print("FOUND PO FOR THIS INVOICE")
    
     return True   
 
-    
-    
-# API Endpoint
-@app.route('/invoice/<string:invoiceID>', methods=['GET'])
-def get_po_data(invoiceID):
+def get_data(invoiceID):
     # result=invoice_data
     line_items=[]
     charges=[]
@@ -1113,29 +1195,19 @@ def get_po_data(invoiceID):
     (rec.get('PONumber') for rec in (invoice_data or []) if isinstance(rec, dict) and 'PONumber' in rec),
     None
 )
-
-    testinvoice_datapo='368526'
-
     PoDbData=getDBPORecordById(invoice_datapo)
     PoData= clean_po_line_data(PoDbData)
-    print(PoData)
-    #print(PoData)
-    
-    print(invoice_data)
-    #Validate Invoice against PO if it passes calculate tax etc.
+   
+    #check if invoice exists and if po exists
     result = validate_single_po(invoiceID,invoice_data,PoData)
-    
-    
     if result is not True:
-        return jsonify(result[0]), result[1]
+       
+        return JSONResponse(content=result[0], status_code=result[1])
 
 
-    #function to replace 
-    # if not validate_invoice_items_against_po(invoice_data, PoData):
-    #     return jsonify({'status': 'error', 'message': 'Invoice item mismatch'}), 400
-    
+    #compare invoice part numbers to po and AI checking for missing partnumbers and general items
     resp = validate_and_match_invoice_items_against_po_strict(
-    invoice_id=invoice_data[0]['invoiceID'],
+    invoice_id=invoiceID,
     invoice_items=invoice_data,
     po_items=PoData,
     ai_match_fn=chatgpt_match_by_description,
@@ -1143,49 +1215,56 @@ def get_po_data(invoiceID):
     )
 
     if resp["pass"]:
-        # New po and invoice structures from validate_and_match function with all the id-s 
+        # New po and invoice structures from validate_and_match function with all the id-s including the added ones from descp AI matching 
         invoice_items_ready = resp["invoice_items_resolved"]
         po_items_ready      = resp["po_items_resolved"]
     else:
         # Inspect why it failed
         #print("aiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii response")
-        #print(resp["ai_resp"])
-        
-        #print(resp.get("desc_attempts", []))
-        return {
+        print(resp["fail_reasons"])
+        return JSONResponse(content={
+        "invoiceid" : resp['invoice_id'],
+        "po_id":resp['po_id'],
+        "invoice_type" :"manual_review",
+        "message":"AI Item Matching failed",
         "fail_reasons": resp["fail_reasons"],
-        #"desc_matches": resp["desc_matches"],
-        #"AI_Response": resp["ai_resp"]
-        }
+        "ai_Response": resp["ai_resp"],
+        'status': 'error'
+        },status_code= 400)
         
        
 
     #print("INVOICE ITEMS AFTER VALIDAAAAATIIIIIONNNNNNN")
     #print(invoice_items_ready)
 
-    if not check_for_duplicate_items(invoice_data):
+    if not check_for_duplicate_items(invoice_items_ready):
+        return JSONResponse(content={'invoiceid':f'{invoiceID}','ponumber':f'{invoice_datapo}','status': 'error', 'message': 'Duplicate item IDs found','invoice_type':'manual_review'},status_code=400)
+    
+    validate=validatevouch(invoice_items_ready, po_items_ready)
+    if validate["status"] == "error":
+        return JSONResponse(content=validate, status_code=validate["code"])
+    
+    
 
-        return jsonify({'status': 'error', 'message': 'Duplicate item IDs found'}), 400
-    if not validatevouch(invoice_data, PoData):
-        return jsonify({'status': 'error', 'message': 'Vouchering failed'}), 400
-    
-    
-    close_po=can_close_po(invoice_data, PoData)
+
+    #Calculate tax freight close po 
+
+    close_po=can_close_po(invoice_items_ready, po_items_ready)
     print("Can close po:")
     print(close_po)
     #check Db if it has taxes
-    IsInlineTax=invoice_data[0]['isTaxInLine']
-    shared_special_handling=invoice_data[0]['InvoiceDetailSummary:SpecialHandlingAmount']
+    IsInlineTax=invoice_items_ready[0]['isTaxInLine']
+    shared_special_handling=invoice_items_ready[0]['InvoiceDetailSummary:SpecialHandlingAmount']
 
     if IsInlineTax=='yes':
         hastax=True
-        tax_info=check_taxinfo(PoData,invoice_data)
+        tax_info=check_taxinfo(po_items_ready,invoice_items_ready)
         
     else:
         hastax=False
         
     
-        #check if freight is there 
+        #check if there is freight
     if shared_special_handling is not None and shared_special_handling > 0 and shared_special_handling<=500:
         hasextracharges=True
         extra_charge_count=extra_charge_count+1
@@ -1200,7 +1279,7 @@ def get_po_data(invoiceID):
         print("Extra Charges:")
         print(charges)
     elif shared_special_handling>500:
-         return jsonify({'status': 'error', 'message': 'Freight needs manual review, Freight exceeds 500 Dollars!'}), 400
+         return JSONResponse(content={'invoiceid':f'{invoiceID}','ponumber':f'{invoice_datapo}','status': 'error', 'message': 'Freight needs manual review, Freight exceeds 500 Dollars!','invoice_type':'manual_review'},status_code=400)
     else:
         hasextracharges=False
         
@@ -1219,16 +1298,16 @@ def get_po_data(invoiceID):
     #     })
           
     
-    for item in invoice_data:
+    for item in invoice_items_ready:
         item_id = item['SellerPartNumber'].lower()
         unit_price = item['InvoiceDetailItem:UnitPrice'] 
         quantity = item['InvoiceDetailItem:quantity']
         line_item_count=line_item_count+1
-        poitem= next((po for po in PoData if po['vendor_part'].lower() == item_id), None)
+        poitem= next((po for po in po_items_ready if po['vendor_part'].lower() == item_id), None)
         line_number=poitem['line_no']
         line_source=poitem['line_source']
         line_items.append({
-        'line_number':line_number,#this value has to come from sampro db
+        'line_number':line_number,
         'line_source':line_source,
         'item_id': item_id,
         'quantity': quantity,
@@ -1239,16 +1318,16 @@ def get_po_data(invoiceID):
         
     })
         
-    poview=sortlinenumbers(PoData,line_items)
-    print(poview)
+    poview=sortlinenumbers(po_items_ready,line_items)
+    #print(poview)
 
    #get gl_entity by glentty or by job_id
     short_gl=''
-    gl_entity = PoData[0]['glentty_id'].lower()
-    job_id = PoData[0]['jb_id'].upper()
+    gl_entity = po_items_ready[0]['glentty_id'].lower()
+    job_id = po_items_ready[0]['jb_id'].upper()
     
     if  gl_entity:
-        short_gl = PoData[0]['glentty_id'].lower()
+        short_gl = po_items_ready[0]['glentty_id'].lower()
         gl_entty = short_gl[:2] + 'a99'
     else:
         job_id = job_id[:2]
@@ -1259,11 +1338,11 @@ def get_po_data(invoiceID):
         print("glentity-jobid:")
     response = {
         'type': 'general_info',
-        'po_number': invoice_data[0]['PONumber'],    
-        'invoice_number': invoice_data[0]['invoiceID'],
-        'invoice_date': invoice_data[0]['createdAt'],
+        'po_number': invoice_items_ready[0]['PONumber'],    
+        'invoice_number': invoice_items_ready[0]['invoiceID'],
+        'invoice_date': invoice_items_ready[0]['createdAt'],
         
-        'invoice_total': invoice_data[0]['InvoiceDetailSummary:NetAmount'],
+        'invoice_total': invoice_items_ready[0]['InvoiceDetailSummary:NetAmount'],
         'gl_entity_id':gl_entty,
         'has_taxes': hastax,
         'tax_info': tax_info,
@@ -1291,13 +1370,120 @@ def get_po_data(invoiceID):
     #emailcontent += "\n?()?\n"
     send_email(emailcontent)
     print("Invoice Processed Successfully.")
-    print("TOTAL:",invoice_data[0]['InvoiceDetailSummary:NetAmount'])
+    print("TOTAL:",invoice_items_ready[0]['InvoiceDetailSummary:NetAmount'])
 
 
 
     print(charges)
 
-    return jsonify(uiresponse)
+    return JSONResponse(content=uiresponse,status_code=200)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+# @app.route('/purchaseorder/<string:poID>', methods=['GET'])
+# def get_podata(poID):
+    
+# API Endpoint
+@app.get("/invoice/{invoiceID}")
+def get_po_data(invoiceID: str):
+
+ #function that calls all other validator functions
+    return get_data(invoiceID)
+
+#API Endpoint invoice-succesufully-proccesed by rpa bot
+@app.post("/rpa/invoice-processed")
+def process_invoice(payload: dict):
+    invoice_id = payload.get("invoice_id").lower()
+    po_number = payload.get("po_number").lower()
+
+    if not invoice_id or not po_number:
+         return JSONResponse(status_code=400, content={
+        "success": False,
+        "code": "MISSING_FIELDS",
+        "message": "Missing invoice_id or po_number in request.",
+        "errors": []
+        }
+        )
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        #check if invoice exists in processscheduler table 
+        cursor.execute("""
+            SELECT 1 FROM processscheduler
+            WHERE Invoice_id = %s AND Sampro_ponumber = %s
+        """, (invoice_id, po_number))
+
+        if cursor.fetchone() is None:
+            return JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "code": "INVOICE_NOT_FOUND",
+                "message": "The invoice or PO number was not found in processsscheduler.",
+                "errors": [f"invoice_id: {invoice_id}", f"po_number: {po_number}"]
+            }
+        )
+        #Select oldest locked invoice for this PO
+        cursor.execute("""
+            SELECT * FROM processscheduler
+            WHERE Sampro_ponumber = %s AND locked = 1
+            ORDER BY Date ASC
+        """, (po_number,))
+        locked_invoices = cursor.fetchall()
+
+        for inv in locked_invoices:
+            inv_id = inv['invoice_id']
+            result, status_code = get_data(inv_id)
+
+            if status_code == 200:
+                cursor.execute("""
+                    UPDATE processscheduler
+                    SET status = 'ready_to_be_processed', locked = 0
+                    WHERE Invoice_id = %s
+                """, (inv_id,))
+                conn.commit()
+                break
+            else:
+                status_reason = result.get("message", "validation_failed")
+                new_status = result.get("invoice_type", "error")
+
+                cursor.execute("""
+                    UPDATE processscheduler
+                    SET status = %s, status_reason = %s, locked = 0
+                    WHERE Invoice_id = %s
+                """, (new_status, status_reason, inv_id))
+
+            conn.commit()
+
+        #Mark the triggering invoice as processed
+        cursor.execute("""
+            UPDATE processscheduler
+            SET status = 'Processed', locked = 0
+            WHERE Invoice_id = %s
+        """, (invoice_id,))
+        conn.commit()
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "code": "INVOICE_PROCESSED",
+                "message": "Invoice processed and PO queue updated successfully.",
+                "data": {
+                    "invoice_id": invoice_id,
+                    "po_number": po_number,
+                    "updated": True
+                }
+            }
+        )
+
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
