@@ -1392,8 +1392,8 @@ def get_po_data(invoiceID: str):
 #API Endpoint invoice-succesufully-proccesed by rpa bot
 @app.post("/rpa/invoice-processed")
 def process_invoice(payload: dict):
-    invoice_id = payload.get("invoice_id").lower()
-    po_number = payload.get("po_number").lower()
+    invoice_id = payload.get("invoice_id").strip().lower()
+    po_number = payload.get("po_number").strip().lower()
 
     if not invoice_id or not po_number:
          return JSONResponse(status_code=400, content={
@@ -1439,7 +1439,7 @@ def process_invoice(payload: dict):
             if status_code == 200:
                 cursor.execute("""
                     UPDATE processscheduler
-                    SET status = 'ready_to_be_processed', locked = 0
+                    SET status = 'ready_to_be_processed', locked = 0,Date = NOW()
                     WHERE Invoice_id = %s
                 """, (inv_id,))
                 conn.commit()
@@ -1450,7 +1450,7 @@ def process_invoice(payload: dict):
 
                 cursor.execute("""
                     UPDATE processscheduler
-                    SET status = %s, status_reason = %s, locked = 0
+                    SET status = %s, status_reason = %s, locked = 0,Date = NOW()
                     WHERE Invoice_id = %s
                 """, (new_status, status_reason, inv_id))
 
@@ -1459,7 +1459,7 @@ def process_invoice(payload: dict):
         #Mark the triggering invoice as processed
         cursor.execute("""
             UPDATE processscheduler
-            SET status = 'Processed', locked = 0
+            SET status = 'Processed', locked = 0,Date = NOW()
             WHERE Invoice_id = %s
         """, (invoice_id,))
         conn.commit()
@@ -1485,5 +1485,60 @@ def process_invoice(payload: dict):
     finally:
         cursor.close()
         conn.close()
+
+
+
+
+@app.post("/rpa/failed")
+def rpa_failed(payload: dict):
+   
+    invoice_id = payload.get("invoice_id").strip().lower()
+    po_number = payload.get("po_number").strip().lower()
+    failed_reason = payload.get("failed_reason").strip().lower()
+
+    status = "failed"
+    status_reason = "rpa" + failed_reason  
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        sql = """
+            UPDATE processscheduler
+            SET Status = %s,
+                Status_reason = %s,
+                Date = NOW()
+            WHERE LOWER(Invoice_id) = %s
+              AND LOWER(Sampro_ponumber) = %s
+        """
+        cur.execute(sql, (status, status_reason, invoice_id, po_number))
+        conn.commit()
+
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="No matching invoice_id + po_number in processscheduler."
+            )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "code": "db_updated",
+                "message": "Status updated to failed.",
+                "data": {
+                    "invoice_id": invoice_id,
+                    "po_number": po_number,
+                    "status": status,
+                    "status_reason": status_reason,
+                },
+            },
+        )
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
 
 
