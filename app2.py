@@ -17,7 +17,7 @@ import uvicorn
 
 # print(pyodbc.version)
 
-load_dotenv("env")
+load_dotenv()
 print("TEST_ENV_SOURCE =", os.getenv("TEST_ENV_SOURCE"))
 
 app = FastAPI()
